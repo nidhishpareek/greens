@@ -558,6 +558,89 @@ jobs:
           # Substring-collision safety: TestOrg-Labs must not match TestOrg
           echo "$out" | grep -q 'repo-similar'      && assert fail 'substring-org rejected'       || assert pass 'substring-org rejected'
 
+      - name: Local-only mode reads commits without cloning or fetching
+        run: |
+          set -e
+          base="$(mktemp -d)"
+          work="$base/work"
+          mirror="$base/mirror"
+          mirror_bare="$base/mirror-bare"
+          cache="$base/cache"
+          cfg="$base/config"
+          mkdir -p "$work" "$mirror" "$cache" "$base/logs"
+
+          # Commits exist only in the local checkout. The origin host is not
+          # reachable; --local must not try to clone or fetch it.
+          repo="$work/kept-repo"
+          git init -q "$repo"
+          git -C "$repo" remote add origin git@gitlab.invalid:ExampleOrg/kept-repo.git
+          GIT_AUTHOR_NAME=W GIT_AUTHOR_EMAIL=me@work.test GIT_COMMITTER_NAME=W GIT_COMMITTER_EMAIL=me@work.test \
+            GIT_AUTHOR_DATE="2026-05-01 09:00:00 +0530" GIT_COMMITTER_DATE="2026-05-01 09:00:00 +0530" \
+            git -C "$repo" commit --allow-empty -qm "real local commit"
+          GIT_AUTHOR_NAME=O GIT_AUTHOR_EMAIL=other@work.test GIT_COMMITTER_NAME=O GIT_COMMITTER_EMAIL=other@work.test \
+            GIT_AUTHOR_DATE="2026-05-02 09:00:00 +0530" GIT_COMMITTER_DATE="2026-05-02 09:00:00 +0530" \
+            git -C "$repo" commit --allow-empty -qm "someone else"
+
+          skipped="$work/other-org"
+          git init -q "$skipped"
+          git -C "$skipped" remote add origin git@gitlab.invalid:OtherOrg/skipped.git
+          GIT_AUTHOR_NAME=W GIT_AUTHOR_EMAIL=me@work.test GIT_COMMITTER_NAME=W GIT_COMMITTER_EMAIL=me@work.test \
+            GIT_AUTHOR_DATE="2026-05-03 09:00:00 +0530" GIT_COMMITTER_DATE="2026-05-03 09:00:00 +0530" \
+            git -C "$skipped" commit --allow-empty -qm "wrong org"
+
+          git init --bare -q "$mirror_bare"
+          git -C "$mirror_bare" symbolic-ref HEAD refs/heads/main
+          git init -q "$mirror"
+          git -C "$mirror" remote add origin "$mirror_bare"
+          GIT_AUTHOR_NAME=Init GIT_AUTHOR_EMAIL=init@test.com GIT_COMMITTER_NAME=Init GIT_COMMITTER_EMAIL=init@test.com \
+            git -C "$mirror" commit --allow-empty -qm "init"
+          git -C "$mirror" branch -M main
+          git -C "$mirror" push -q origin main
+
+          cat > "$cfg" <<EOF
+          WORK_DIR="$work"
+          EMAILS="me@work.test"
+          REMOTE_PREFIX="git@gitlab.invalid:ExampleOrg/"
+          MIRROR_DIR="$mirror"
+          MIRROR_EMAIL="personal@test.com"
+          ACTIVITY_TYPES="commits"
+          COPY_MESSAGES="0"
+          SINCE="2026-01-01 00:00:00"
+          CACHE_DIR="$cache"
+          LOG_DIR="$base/logs"
+          LOCAL_ONLY="1"
+          EOF
+
+          CONTRIB_MIRROR_CONFIG="$cfg" FORCE=1 bash sync.sh >"$base/out.log" 2>&1
+          echo "--- sync output ---"
+          cat "$base/out.log"
+          echo "--- end output ---"
+
+          grep -q "Local-only mode" "$base/out.log"
+          if grep -q "Cloning " "$base/out.log" || grep -q "Fetching " "$base/out.log"; then
+            echo "FAIL: local-only mode contacted a remote"
+            exit 1
+          fi
+          if [ -n "$(find "$cache" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+            echo "FAIL: local-only mode wrote a bare cache"
+            exit 1
+          fi
+          authors="$(git -C "$mirror" log --format='%ae' | sort -u | tr '\n' ' ')"
+          echo "Authors: $authors"
+          echo "$authors" | grep -q "personal@test.com"
+          if echo "$authors" | grep -q "me@work.test"; then
+            echo "FAIL: work email leaked into the mirror"
+            exit 1
+          fi
+          if echo "$authors" | grep -q "other@work.test"; then
+            echo "FAIL: non-matching author was mirrored"
+            exit 1
+          fi
+          # init + one matching local commit. The other-org repo must not add a third.
+          count="$(git -C "$mirror" rev-list --count HEAD)"
+          [ "$count" -eq 2 ] || { echo "FAIL: expected 2 mirror commits, got $count"; git -C "$mirror" log --oneline; exit 1; }
+          echo "PASS: local-only mode mirrored the on-disk commit and skipped the remote"
+
       - name: Fetch timeout kills a stuck SSH transport
         run: |
           # Regression test: when ssh hangs mid-transfer (no data, no close),

@@ -68,6 +68,7 @@ No source code, file paths, branch names, or messages ever leave your machine (m
 greens                    # sync (runs setup on first use)
 greens sync               # same as above
 greens init               # run setup wizard (alias for --setup)
+greens --local            # sync from local clones only (no clone, no fetch)
 greens --status           # show config and sync status
 greens --setup            # reconfigure
 greens --resync           # wipe and re-sync from scratch
@@ -175,6 +176,7 @@ Set `GITHUB_USERNAME` and authenticate `gh` CLI to enable API features.
 | `COPY_MESSAGES` | No | `0` | Set to `1` to copy raw git commit subjects (PR/issue/review items always get generic labels) |
 | `COPY_MESSAGES_ACK` | No | `0` | Written by setup when you type the `COPY_MESSAGES` confirmation; sync refuses `COPY_MESSAGES=1` without it |
 | `FORCE` | No | `0` | Set to `1` to bypass daily limit (does not bypass the privacy gate) |
+| `LOCAL_ONLY` | No | `0` | Set to `1` to read local clones only. Same as `greens --local`. Origin URLs must still match `REMOTE_PREFIX`, but they are not fetched. |
 
 </details>
 
@@ -211,7 +213,14 @@ If your mirror was ever public while it had the dashboard (all versions up to 1.
 <details>
 <summary>Will this affect my private repos?</summary>
 
-No. The script creates bare caches and never modifies your working directories.
+No. The default sync creates bare caches and never modifies your working directories. `greens --local` does not clone or fetch; it only reads `git log` from the checkouts already on disk.
+
+</details>
+
+<details>
+<summary>Can I sync when I no longer have access to the remote?</summary>
+
+Yes. `greens --local` (or `LOCAL_ONLY=1` in the config) uses the commits already stored in each local `.git` directory. The folder still needs an `origin` whose URL matches `REMOTE_PREFIX`, so greens knows which repos to include. That URL is not contacted. Branches you never fetched are not in the local history, so they are not mirrored. The mirror is still pushed to your personal GitHub repo.
 
 </details>
 

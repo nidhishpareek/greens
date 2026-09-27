@@ -929,14 +929,32 @@ replace_mirror_with_clean_clone() {
   return 1
 }
 
+# --local can sit next to another flag (greens --local, greens sync --local).
+# Strip it before the command switch so it is not reported as unknown.
+_greens_args=()
+for _arg in "$@"; do
+  if [[ "$_arg" == "--local" ]]; then
+    LOCAL_ONLY=1
+  else
+    _greens_args+=("$_arg")
+  fi
+done
+if [[ ${#_greens_args[@]} -gt 0 ]]; then
+  set -- "${_greens_args[@]}"
+else
+  set --
+fi
+unset _arg _greens_args
+
 # CLI flags
 case "${1:-}" in
   --setup|init)   exec "$SCRIPT_DIR/setup.sh" ;;
   sync)      ;; # alias: greens sync = greens (default)
-  --help|-h) echo "Usage: greens [sync|init|--setup|--status|--resync|--privacy-migrate|--reset|--help|--version]"
+  --help|-h) echo "Usage: greens [sync|init|--setup|--status|--resync|--privacy-migrate|--reset|--local|--help|--version]"
              echo "  sync       Run sync (default, same as bare greens)"
              echo "  init       Run interactive setup wizard (alias for --setup)"
              echo "  --setup    Run interactive setup wizard"
+             echo "  --local    Sync from local clones only (do not clone or fetch remotes)"
              echo "  --status   Show current config and sync status"
              echo "  --resync   Wipe mirror history (local + remote) and sync fresh"
              echo "  --privacy-migrate [--keep-messages]"
@@ -1046,6 +1064,7 @@ case "${1:-}" in
     echo "  GitHub user:  ${GITHUB_USERNAME:-not set}"
     echo "  Activity:     ${ACTIVITY_TYPES:-commits}"
     echo "  Since:        ${SINCE:-not set}"
+    echo "  Local only:   ${LOCAL_ONLY:-0}"
     # Last sync
     log_dir="${LOG_DIR:-$HOME/.contrib-mirror/logs}"
     [[ -d "$log_dir" ]] || log_dir="$SCRIPT_DIR/logs"
@@ -1224,6 +1243,11 @@ MIRROR_NAME="${MIRROR_NAME:-greens}"
 # the mirror; merge subjects commonly expose org and branch names. PR/review/
 # issue activity always gets a generic label, never the title.
 COPY_MESSAGES="${COPY_MESSAGES:-0}"
+
+# 1 = never clone or fetch work remotes. Timestamps come from the git history
+# already in each local clone. Origin URLs are still required, and still have
+# to match REMOTE_PREFIX, but they are not contacted. The mirror push is unchanged.
+LOCAL_ONLY="${LOCAL_ONLY:-0}"
 
 # Log directory. Default moved to ~/.contrib-mirror/logs in v1.8.2 (same
 # symlinked-install reason as CACHE_DIR). Migrate old script-dir logs once so
@@ -1457,8 +1481,10 @@ fetch_github_activity_with_messages() {
 
 tmp_pairs="$(mktemp)"
 tmp_sorted="$(mktemp)"
+tmp_local_map="$(mktemp)"
+tmp_scan_dirs="$(mktemp)"
 cleanup() {
-  rm -f "$tmp_pairs" "$tmp_sorted" /tmp/greens_*.txt 2>/dev/null || true
+  rm -f "$tmp_pairs" "$tmp_sorted" "$tmp_local_map" "$tmp_local_map.sorted" "$tmp_scan_dirs" /tmp/greens_*.txt 2>/dev/null || true
   rm -rf "$LOCK_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -1530,6 +1556,14 @@ log "  (Looking for git repos that match your org: $REMOTE_PREFIX)"
 # Discover repos
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Record a discovered repo for both the remote-cache path and --local.
+# $1 remote repo basename, $2 origin url, $3 local checkout path.
+record_discovered_repo() {
+  local remote_repo="$1" url="$2" repodir="$3"
+  printf '%s %s\n' "$remote_repo" "$url" >> "$tmp_pairs"
+  printf '%s\t%s\n' "$remote_repo" "$repodir" >> "$tmp_local_map"
+}
+
 find "$WORK_DIR" -maxdepth 2 -name .git -print 2>/dev/null | while read -r gitpath; do
   repodir="$(dirname "$gitpath")"
 
@@ -1557,7 +1591,7 @@ find "$WORK_DIR" -maxdepth 2 -name .git -print 2>/dev/null | while read -r gitpa
       *) continue ;;
     esac
     remote_repo="$(basename "$url")"
-    printf "%s %s\n" "$remote_repo" "$url" >> "$tmp_pairs"
+    record_discovered_repo "$remote_repo" "$url" "$repodir"
     continue
   fi
   normalized=""
@@ -1578,7 +1612,7 @@ find "$WORK_DIR" -maxdepth 2 -name .git -print 2>/dev/null | while read -r gitpa
   url="$normalized"
 
   remote_repo="$(basename "$url")"
-  printf "%s %s\n" "$remote_repo" "$url" >> "$tmp_pairs"
+  record_discovered_repo "$remote_repo" "$url" "$repodir"
 done
 
 if [[ ! -s "$tmp_pairs" ]]; then
@@ -1587,11 +1621,15 @@ if [[ ! -s "$tmp_pairs" ]]; then
 fi
 
 LC_ALL=C sort -u "$tmp_pairs" > "$tmp_sorted"
+LC_ALL=C sort -u "$tmp_local_map" > "$tmp_local_map.sorted"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fetch into bare caches (safe for local WIP)
 # ─────────────────────────────────────────────────────────────────────────────
 
+failures=0
+fetched_ok=0
+if [[ "$LOCAL_ONLY" != "1" ]]; then
 # Never block on auth/host-key prompts and drop stalled SSH connections fast.
 # Without ServerAliveInterval a midnight launchd/cron run can hang for hours
 # when WiFi drops mid-transfer — ssh stays alive with no progress.
@@ -1672,13 +1710,38 @@ while read -r remote_repo url; do
   fi
   fetched_ok=$((fetched_ok + 1))
 done < "$tmp_sorted"
+else
+  repo_total="$(wc -l < "$tmp_sorted" | tr -d " ")"
+  log ""
+  log "Step 2/5: Local-only mode — reading $repo_total repos already on disk (no clone, no fetch)"
+  : > "$tmp_scan_dirs"
+  while IFS=$'\t' read -r remote_repo repodir; do
+    [[ -z "${repodir:-}" ]] && continue
+    if ! git -C "$repodir" rev-parse --git-dir >/dev/null 2>&1; then
+      log "WARN: $repodir is not a git checkout"
+      failures=$((failures + 1))
+      continue
+    fi
+    printf '%s\n' "$repodir" >> "$tmp_scan_dirs"
+    log "Using local $remote_repo"
+    fetched_ok=$((fetched_ok + 1))
+  done < "$tmp_local_map.sorted"
+fi
 
 if [[ "$failures" -gt 0 ]]; then
-  log "WARN: $failures repos failed to fetch"
+  if [[ "$LOCAL_ONLY" == "1" ]]; then
+    log "WARN: $failures repos could not be read locally"
+  else
+    log "WARN: $failures repos failed to fetch"
+  fi
 fi
 
 if [[ "$fetched_ok" -eq 0 ]]; then
-  log "ERROR: all fetches failed; not proceeding with stale data."
+  if [[ "$LOCAL_ONLY" == "1" ]]; then
+    log "ERROR: no local repos could be read; not creating mirror commits."
+  else
+    log "ERROR: all fetches failed; not proceeding with stale data."
+  fi
   exit 1
 fi
 
@@ -1698,7 +1761,21 @@ log ""
 log "Step 3/5: Scanning commits across all branches (emails: $EMAILS)"
 log "  (Checks every branch — feature, hotfix, etc. No double-counting after merge)"
 
-# Collect git commits (with or without messages based on COPY_MESSAGES)
+# Collect git commits (with or without messages based on COPY_MESSAGES).
+# --local reads the working copies recorded during discovery. The cache path
+# is unchanged: bare clones, filtered by REMOTE_PREFIX.
+if [[ "$LOCAL_ONLY" == "1" ]]; then
+  while IFS= read -r scan_dir; do
+    [[ -z "$scan_dir" ]] && continue
+    for email in ${EMAIL_ARRAY[@]+"${EMAIL_ARRAY[@]}"}; do
+      if [[ "$COPY_MESSAGES" == "1" ]]; then
+        git -C "$scan_dir" log --all --since="$SINCE" --fixed-strings --regexp-ignore-case --author="<$email>" --format="%ai	%s" 2>/dev/null || true
+      else
+        git -C "$scan_dir" log --all --since="$SINCE" --fixed-strings --regexp-ignore-case --author="<$email>" --format="%ai" 2>/dev/null || true
+      fi
+    done
+  done < "$tmp_scan_dirs"
+else
 for bare in "$CACHE_DIR"/*.git; do
   [[ -d "$bare" ]] || continue
 
@@ -1718,7 +1795,8 @@ for bare in "$CACHE_DIR"/*.git; do
       git --git-dir="$bare" log --all --since="$SINCE" --fixed-strings --regexp-ignore-case --author="<$email>" --format="%ai" 2>/dev/null || true
     fi
   done
-done >> "$tmp_all_data"
+done
+fi >> "$tmp_all_data"
 
 # Fetch GitHub activity (PRs, reviews, issues)
 if [[ "$ACTIVITY_TYPES" == *"reviews"* ]]; then
@@ -1837,6 +1915,21 @@ if [[ "$(mirror_visibility)" == "private" ]]; then
   # Collect per-repo stats
   tmp_repo_stats="$(mktemp)"
   tmp_dates="$(mktemp)"
+  if [[ "$LOCAL_ONLY" == "1" ]]; then
+    while IFS= read -r scan_dir; do
+      [[ -z "$scan_dir" ]] && continue
+      repo_name="$(basename "$scan_dir")"
+      repo_commits=0
+      for email in ${EMAIL_ARRAY[@]+"${EMAIL_ARRAY[@]}"}; do
+        count="$(git -C "$scan_dir" log --all --since="$SINCE" --fixed-strings --regexp-ignore-case --author="<$email>" --format="%H" 2>/dev/null | wc -l | tr -d " ")"
+        repo_commits=$((repo_commits + count))
+        git -C "$scan_dir" log --all --since="$SINCE" --fixed-strings --regexp-ignore-case --author="<$email>" --format="%ad" --date=short 2>/dev/null >> "$tmp_dates" || true
+      done
+      if [[ "$repo_commits" -gt 0 ]]; then
+        printf "%d|%s\n" "$repo_commits" "$repo_name" >> "$tmp_repo_stats"
+      fi
+    done < "$tmp_scan_dirs"
+  else
   for bare in "$CACHE_DIR"/*.git; do
     [[ -d "$bare" ]] || continue
     repo_name="$(basename "$bare" .git)"
@@ -1858,6 +1951,7 @@ if [[ "$(mirror_visibility)" == "private" ]]; then
       printf "%d|%s\n" "$repo_commits" "$repo_name" >> "$tmp_repo_stats"
     fi
   done
+  fi
 
   sorted_repos="$(sort -t'|' -k1 -nr "$tmp_repo_stats")"
   total_commits="$(echo "$sorted_repos" | awk -F'|' '{sum+=$1} END {print sum}')"
